@@ -1,4 +1,4 @@
-# HARINFOOD PRINTER v1.3 - satu berkas ini membuat dan membangun aplikasi Android (APK) otomatis di GitHub.
+# HARINFOOD PRINTER v1.4 - satu berkas ini membuat dan membangun aplikasi Android (APK) otomatis di GitHub.
 # Simpan sebagai: .github/workflows/build.yml
 name: Build APK
 
@@ -59,8 +59,8 @@ jobs:
                   applicationId "id.my.mra.harinfoodprinter"
                   minSdk 24
                   targetSdk 34
-                  versionCode 4
-                  versionName "1.3"
+                  versionCode 5
+                  versionName "1.4"
               }
 
               buildTypes {
@@ -87,7 +87,6 @@ jobs:
           import android.app.Activity;
           import android.bluetooth.BluetoothAdapter;
           import android.bluetooth.BluetoothDevice;
-          import android.bluetooth.BluetoothSocket;
           import android.content.Context;
           import android.content.SharedPreferences;
           import android.content.Intent;
@@ -98,6 +97,7 @@ jobs:
           import android.os.Build;
           import android.os.Bundle;
           import android.os.Message;
+          import android.os.PowerManager;
           import android.print.PrintAttributes;
           import android.print.PrintDocumentAdapter;
           import android.print.PrintManager;
@@ -117,8 +117,6 @@ jobs:
           import org.json.JSONArray;
           import org.json.JSONObject;
 
-          import java.io.OutputStream;
-          import java.util.UUID;
 
           import com.google.android.gms.common.api.ResolvableApiException;
           import com.google.android.gms.location.LocationRequest;
@@ -139,7 +137,6 @@ jobs:
               private static final int GPS_RESOLVE_REQ = 4712;
               private static final int LOCATION_PERM_REQ = 4713;
               private static final int BT_PERM_REQ = 4714;
-              private static final UUID SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
 
               private WebView webView;
               private ValueCallback<Uri[]> filePathCallback;
@@ -200,47 +197,32 @@ jobs:
                   }
               }
 
+              // ---- Layanan latar belakang ----
+              private boolean hasBtConnect() {
+                  return Build.VERSION.SDK_INT < 31 || checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED;
+              }
+
+              private void startBgService() {
+                  if (!hasBtConnect()) {
+                      Toast.makeText(this, "Izinkan akses Bluetooth agar cetak otomatis bisa jalan di latar belakang", Toast.LENGTH_LONG).show();
+                      return;
+                  }
+                  try {
+                      Intent i = new Intent(this, PrintService.class);
+                      if (Build.VERSION.SDK_INT >= 26) startForegroundService(i); else startService(i);
+                  } catch (Exception e) {
+                      Toast.makeText(this, "Layanan latar belakang gagal dimulai", Toast.LENGTH_LONG).show();
+                  }
+              }
+
+              private void stopBgService() {
+                  try { stopService(new Intent(this, PrintService.class)); } catch (Exception ignored) {}
+              }
+
               // ---- Cetak LANGSUNG ke printer Bluetooth (tanpa aplikasi RawBT) ----
               private SharedPreferences prefs() { return getSharedPreferences("harin", MODE_PRIVATE); }
 
-              private synchronized String sendBytesToPrinter(byte[] data) {
-                  String addr = prefs().getString("printer", "");
-                  if (addr.isEmpty()) return "Printer Bluetooth belum dipilih";
-                  BluetoothAdapter ad = BluetoothAdapter.getDefaultAdapter();
-                  if (ad == null) return "Perangkat tidak punya Bluetooth";
-                  if (!ad.isEnabled()) return "Bluetooth HP mati. Nyalakan dulu";
-                  BluetoothSocket sock = null;
-                  try {
-                      BluetoothDevice dev = ad.getRemoteDevice(addr);
-                      try { ad.cancelDiscovery(); } catch (Exception ignored) {}
-                      try {
-                          sock = dev.createRfcommSocketToServiceRecord(SPP_UUID);
-                          sock.connect();
-                      } catch (Exception e1) {
-                          try { if (sock != null) sock.close(); } catch (Exception ignored) {}
-                          sock = (BluetoothSocket) dev.getClass().getMethod("createRfcommSocket", new Class[]{int.class}).invoke(dev, 1);
-                          sock.connect();
-                      }
-                      OutputStream os = sock.getOutputStream();
-                      int off = 0;
-                      while (off < data.length) {
-                          int n = Math.min(1024, data.length - off);
-                          os.write(data, off, n);
-                          os.flush();
-                          off += n;
-                          Thread.sleep(12);
-                      }
-                      Thread.sleep(700); // beri waktu printer menyelesaikan cetak sebelum koneksi ditutup
-                      return "OK";
-                  } catch (SecurityException se) {
-                      return "Izin Bluetooth belum diberikan";
-                  } catch (Exception e) {
-                      String m = e.getMessage();
-                      return "Gagal tersambung ke printer" + (m == null ? "" : " (" + m + ")") + ". Pastikan printer menyala & berdekatan";
-                  } finally {
-                      try { if (sock != null) sock.close(); } catch (Exception ignored) {}
-                  }
-              }
+              private String sendBytesToPrinter(byte[] data) { return BtPrinter.send(this, data); }
 
               private void notifyPrintDone(final String jobId, final String result) {
                   webView.post(() -> webView.evaluateJavascript(
@@ -270,6 +252,35 @@ jobs:
                       } catch (Exception e) {
                           return "ERR:" + e.getMessage();
                       }
+                  }
+
+                  /** Nyalakan/matikan layanan latar belakang (cetak otomatis saat HP terkunci). */
+                  @JavascriptInterface
+                  public void setBackgroundPrint(final boolean on) {
+                      prefs().edit().putBoolean("bgservice", on).apply();
+                      runOnUiThread(() -> { if (on) startBgService(); else stopBgService(); });
+                  }
+
+                  @JavascriptInterface
+                  public boolean isBackgroundPrint() { return prefs().getBoolean("bgservice", false); }
+
+                  @JavascriptInterface
+                  public boolean isBatteryExempt() {
+                      try {
+                          PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                          return pm.isIgnoringBatteryOptimizations(getPackageName());
+                      } catch (Exception e) { return false; }
+                  }
+
+                  @JavascriptInterface
+                  public void requestBatteryExempt() {
+                      runOnUiThread(() -> {
+                          try {
+                              startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + getPackageName())));
+                          } catch (Exception e) {
+                              try { startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)); } catch (Exception ignored) {}
+                          }
+                      });
                   }
 
                   @JavascriptInterface
@@ -353,9 +364,10 @@ jobs:
                   // Layar tetap menyala selama aplikasi terbuka (supaya pesanan bisa tercetak otomatis)
                   getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
-                  if (Build.VERSION.SDK_INT >= 31 && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-                      requestPermissions(new String[]{Manifest.permission.BLUETOOTH_CONNECT}, BT_PERM_REQ);
-                  }
+                  java.util.ArrayList<String> need = new java.util.ArrayList<>();
+                  if (Build.VERSION.SDK_INT >= 31 && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) need.add(Manifest.permission.BLUETOOTH_CONNECT);
+                  if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) need.add(Manifest.permission.POST_NOTIFICATIONS);
+                  if (!need.isEmpty()) requestPermissions(need.toArray(new String[0]), BT_PERM_REQ);
 
                   webView = new WebView(this);
                   setContentView(webView);
@@ -453,6 +465,8 @@ jobs:
                       }
                   });
 
+                  if (prefs().getBoolean("bgservice", false)) startBgService();
+
                   if (savedInstanceState != null) webView.restoreState(savedInstanceState);
                   else webView.loadUrl(START_URL);
               }
@@ -460,6 +474,10 @@ jobs:
               @Override
               public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
                   super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                  if (requestCode == BT_PERM_REQ) {
+                      if (prefs().getBoolean("bgservice", false)) startBgService();
+                      return;
+                  }
                   if (requestCode != LOCATION_PERM_REQ) return;
                   boolean granted = false;
                   for (int r : grantResults) if (r == PackageManager.PERMISSION_GRANTED) granted = true;
@@ -503,6 +521,507 @@ jobs:
               }
           }
           HARIN_EOF
+          mkdir -p app/src/main/java/id/my/mra/harinfoodprinter
+          cat > app/src/main/java/id/my/mra/harinfoodprinter/BtPrinter.java <<'HARIN_EOF'
+          package id.my.mra.harinfoodprinter;
+
+          import android.bluetooth.BluetoothAdapter;
+          import android.bluetooth.BluetoothDevice;
+          import android.bluetooth.BluetoothSocket;
+          import android.content.Context;
+
+          import java.io.OutputStream;
+          import java.util.UUID;
+
+          /** Kirim data ESC/POS langsung ke printer Bluetooth (SPP) yang dipilih di aplikasi. Dipakai oleh layar & layanan latar belakang. */
+          public final class BtPrinter {
+              private static final UUID SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
+
+              private BtPrinter() {}
+
+              /** Mengembalikan "OK" bila berhasil, selain itu pesan kesalahan. */
+              public static synchronized String send(Context ctx, byte[] data) {
+                  String addr = ctx.getSharedPreferences("harin", Context.MODE_PRIVATE).getString("printer", "");
+                  if (addr.isEmpty()) return "Printer Bluetooth belum dipilih";
+                  BluetoothAdapter ad = BluetoothAdapter.getDefaultAdapter();
+                  if (ad == null) return "Perangkat tidak punya Bluetooth";
+                  if (!ad.isEnabled()) return "Bluetooth HP mati. Nyalakan dulu";
+                  BluetoothSocket sock = null;
+                  try {
+                      BluetoothDevice dev = ad.getRemoteDevice(addr);
+                      try { ad.cancelDiscovery(); } catch (Exception ignored) {}
+                      try {
+                          sock = dev.createRfcommSocketToServiceRecord(SPP_UUID);
+                          sock.connect();
+                      } catch (Exception e1) {
+                          try { if (sock != null) sock.close(); } catch (Exception ignored) {}
+                          sock = (BluetoothSocket) dev.getClass().getMethod("createRfcommSocket", new Class[]{int.class}).invoke(dev, 1);
+                          sock.connect();
+                      }
+                      OutputStream os = sock.getOutputStream();
+                      int off = 0;
+                      while (off < data.length) {
+                          int n = Math.min(1024, data.length - off);
+                          os.write(data, off, n);
+                          os.flush();
+                          off += n;
+                          Thread.sleep(12);
+                      }
+                      Thread.sleep(700); // beri waktu printer menyelesaikan cetak sebelum koneksi ditutup
+                      return "OK";
+                  } catch (SecurityException se) {
+                      return "Izin Bluetooth belum diberikan";
+                  } catch (Exception e) {
+                      String m = e.getMessage();
+                      return "Gagal tersambung ke printer" + (m == null ? "" : " (" + m + ")") + ". Pastikan printer menyala & berdekatan";
+                  } finally {
+                      try { if (sock != null) sock.close(); } catch (Exception ignored) {}
+                  }
+              }
+          }
+          HARIN_EOF
+          mkdir -p app/src/main/java/id/my/mra/harinfoodprinter
+          cat > app/src/main/java/id/my/mra/harinfoodprinter/PrintService.java <<'HARIN_EOF'
+          package id.my.mra.harinfoodprinter;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.ServiceInfo;
+          import android.os.Build;
+          import android.os.IBinder;
+          import android.os.PowerManager;
+          import android.util.Base64;
+          import android.webkit.CookieManager;
+
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.text.SimpleDateFormat;
+          import java.util.Date;
+          import java.util.Locale;
+
+          /**
+           * Layanan latar depan: tetap memeriksa pesanan pelanggan baru & mencetaknya ke printer Bluetooth
+           * walaupun layar HP terkunci atau aplikasi tidak sedang dibuka.
+           */
+          public class PrintService extends Service {
+              private static final String BASE = "https://harinfood.mra.my.id/";
+              private static final String CHANNEL = "harin_print";
+              private static final int NOTIF_ID = 4101;
+
+              private volatile boolean running = false;
+              private Thread worker;
+              private PowerManager.WakeLock wakeLock;
+              private String lastText = "";
+
+              @Override
+              public IBinder onBind(Intent intent) { return null; }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  SharedPreferences prefs = getSharedPreferences("harin", Context.MODE_PRIVATE);
+                  if (!prefs.getBoolean("bgservice", false)) { stopSelf(); return START_NOT_STICKY; }
+                  try {
+                      Notification n = buildNotification("Menunggu pesanan…");
+                      if (Build.VERSION.SDK_INT >= 29) startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
+                      else startForeground(NOTIF_ID, n);
+                  } catch (Exception e) { stopSelf(); return START_NOT_STICKY; }
+                  if (!running) {
+                      running = true;
+                      try {
+                          PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                          wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "harin:print");
+                          wakeLock.acquire();
+                      } catch (Exception ignored) {}
+                      worker = new Thread(this::loop, "harin-print");
+                      worker.start();
+                  }
+                  return START_STICKY;
+              }
+
+              @Override
+              public void onDestroy() {
+                  running = false;
+                  if (worker != null) worker.interrupt();
+                  try { if (wakeLock != null && wakeLock.isHeld()) wakeLock.release(); } catch (Exception ignored) {}
+                  super.onDestroy();
+              }
+
+              // ---------- notifikasi ----------
+              private Notification buildNotification(String text) {
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      NotificationChannel ch = new NotificationChannel(CHANNEL, "Cetak otomatis", NotificationManager.IMPORTANCE_LOW);
+                      NotificationManager nm = getSystemService(NotificationManager.class);
+                      if (nm != null) nm.createNotificationChannel(ch);
+                  }
+                  Intent open = new Intent(this, MainActivity.class);
+                  open.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                  PendingIntent pi = PendingIntent.getActivity(this, 0, open, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                  Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
+                  b.setContentTitle("Harinfood Printer aktif")
+                   .setContentText(text)
+                   .setSmallIcon(android.R.drawable.ic_menu_info_details)
+                   .setContentIntent(pi)
+                   .setOngoing(true);
+                  return b.build();
+              }
+
+              private void status(String text) {
+                  if (text.equals(lastText)) return;
+                  lastText = text;
+                  try {
+                      NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                      if (nm != null) nm.notify(NOTIF_ID, buildNotification(text));
+                  } catch (Exception ignored) {}
+              }
+
+              // ---------- pemeriksaan pesanan ----------
+              private void loop() {
+                  while (running) {
+                      long wait = 4000;
+                      try {
+                          SharedPreferences prefs = getSharedPreferences("harin", Context.MODE_PRIVATE);
+                          if (!prefs.getBoolean("bgservice", false)) { stopSelf(); return; }
+                          String cookie = CookieManager.getInstance().getCookie(BASE);
+                          if (cookie == null || cookie.isEmpty()) {
+                              status("Belum login kasir — buka aplikasi & login");
+                              wait = 10000;
+                          } else {
+                              JSONObject q = http("GET", BASE + "api.php?action=auto_print_queue", null, cookie);
+                              if (q == null || !"success".equals(q.optString("status"))) {
+                                  status("Sesi kasir berakhir — buka aplikasi & login ulang");
+                                  wait = 10000;
+                              } else {
+                                  JSONArray ids = q.getJSONObject("data").getJSONArray("ids");
+                                  if (ids.length() == 0) {
+                                      status("Siaga • " + new SimpleDateFormat("HH:mm", Locale.getDefault()).format(new Date()));
+                                  }
+                                  for (int i = 0; i < ids.length() && running; i++) {
+                                      if (!processOrder(ids.getInt(i), cookie)) { wait = 10000; break; }
+                                  }
+                              }
+                          }
+                      } catch (InterruptedException ie) {
+                          return;
+                      } catch (Exception e) {
+                          // jaringan putus / server sibuk: coba lagi nanti
+                          wait = 8000;
+                      }
+                      try { Thread.sleep(wait); } catch (InterruptedException ie) { return; }
+                  }
+              }
+
+              /** Mengembalikan false bila pencetakan gagal (supaya jeda lebih lama sebelum mencoba lagi). */
+              private boolean processOrder(int id, String cookie) throws Exception {
+                  JSONObject res = http("POST", BASE + "api.php?action=claim_auto_print", "id=" + id, cookie);
+                  if (res == null || !"success".equals(res.optString("status"))) return true;
+                  JSONObject d = res.optJSONObject("data");
+                  if (d == null || d.optBoolean("skip", false)) return true; // sudah dicetak perangkat lain
+                  String invoice = d.optString("invoice");
+
+                  byte[] bytes;
+                  try {
+                      bytes = ReceiptRenderer.render(d.getJSONObject("receipt"));
+                  } catch (Exception e) {
+                      bytes = Base64.decode(d.getString("escpos"), Base64.DEFAULT); // cadangan: struk teks
+                  }
+                  String result = BtPrinter.send(this, bytes);
+                  if ("OK".equals(result)) {
+                      status("Tercetak #" + invoice + " • " + new SimpleDateFormat("HH:mm", Locale.getDefault()).format(new Date()));
+                      Thread.sleep(800);
+                      return true;
+                  }
+                  // gagal: lepaskan klaim supaya dicoba lagi
+                  try { http("POST", BASE + "api.php?action=release_auto_print", "id=" + id, cookie); } catch (Exception ignored) {}
+                  status("Gagal cetak #" + invoice + ": " + result);
+                  return false;
+              }
+
+              private JSONObject http(String method, String url, String body, String cookie) throws Exception {
+                  HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+                  try {
+                      c.setRequestMethod(method);
+                      c.setConnectTimeout(8000);
+                      c.setReadTimeout(15000);
+                      c.setInstanceFollowRedirects(false);
+                      c.setRequestProperty("Cookie", cookie);
+                      c.setRequestProperty("Accept", "application/json");
+                      if (body != null) {
+                          c.setDoOutput(true);
+                          c.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
+                          OutputStream os = c.getOutputStream();
+                          os.write(body.getBytes("UTF-8"));
+                          os.close();
+                      }
+                      int code = c.getResponseCode();
+                      InputStream is = code >= 400 ? c.getErrorStream() : c.getInputStream();
+                      if (is == null) return null;
+                      ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                      byte[] buf = new byte[4096];
+                      int n;
+                      while ((n = is.read(buf)) > 0) bo.write(buf, 0, n);
+                      is.close();
+                      try { return new JSONObject(bo.toString("UTF-8")); } catch (Exception e) { return null; }
+                  } finally {
+                      c.disconnect();
+                  }
+              }
+          }
+          HARIN_EOF
+          mkdir -p app/src/main/java/id/my/mra/harinfoodprinter
+          cat > app/src/main/java/id/my/mra/harinfoodprinter/ReceiptRenderer.java <<'HARIN_EOF'
+          package id.my.mra.harinfoodprinter;
+
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.DashPathEffect;
+          import android.graphics.Paint;
+          import android.graphics.Typeface;
+
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          import java.io.ByteArrayOutputStream;
+          import java.util.ArrayList;
+          import java.util.List;
+
+          /** Menggambar struk 58mm (384 titik) sama seperti tampilan di halaman web, lalu mengubahnya ke raster ESC/POS. */
+          public final class ReceiptRenderer {
+              private static final int W = 384;
+              private static final float S = 2.1f;
+              private static final int PAD = 8;
+              private static final int CW = W - PAD * 2;
+
+              private interface Op { void draw(Canvas c); }
+
+              private final List<Op> ops = new ArrayList<>();
+              private final Paint measure = new Paint(Paint.ANTI_ALIAS_FLAG);
+              private float y = 6;
+
+              public static byte[] render(JSONObject r) throws Exception {
+                  return new ReceiptRenderer().build(r);
+              }
+
+              // ---------- huruf ----------
+              private void setFont(Paint p, float px, int wt, boolean italic) {
+                  int w = Math.min(800, Math.max(500, wt + 100));
+                  Typeface base;
+                  if (w >= 700) base = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD);
+                  else base = Typeface.create("sans-serif-medium", Typeface.NORMAL);
+                  if (italic) base = Typeface.create(base, base.isBold() ? Typeface.BOLD_ITALIC : Typeface.ITALIC);
+                  p.setTypeface(base);
+                  p.setTextSize(px * S);
+              }
+
+              private Paint paint(float px, int wt, boolean italic, int color, Paint.Align align) {
+                  Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  setFont(p, px, wt, italic);
+                  p.setColor(color);
+                  p.setTextAlign(align);
+                  return p;
+              }
+
+              private int lh(float px) { return Math.round(px * S * 1.1f); }
+
+              private List<String> wrap(Paint p, String text, float maxW) {
+                  List<String> out = new ArrayList<>();
+                  String line = "";
+                  for (String w0 : text.trim().split("\\s+")) {
+                      if (w0.isEmpty()) continue;
+                      String w = w0;
+                      String t = line.isEmpty() ? w : line + " " + w;
+                      if (p.measureText(t) <= maxW) { line = t; continue; }
+                      if (!line.isEmpty()) out.add(line);
+                      while (p.measureText(w) > maxW && w.length() > 1) {
+                          int k = w.length();
+                          while (k > 1 && p.measureText(w.substring(0, k)) > maxW) k--;
+                          out.add(w.substring(0, k));
+                          w = w.substring(k);
+                      }
+                      line = w;
+                  }
+                  if (!line.isEmpty()) out.add(line);
+                  return out;
+              }
+
+              private void text(Canvas c, Paint p, String t, float x, float top) {
+                  c.drawText(t, x, top - p.ascent(), p);
+              }
+
+              // ---------- elemen struk ----------
+              private void centerText(String text, float px, int wt, int color) {
+                  setFont(measure, px, wt, false);
+                  for (String t : wrap(measure, text, CW)) {
+                      final float yy = y;
+                      final String line = t;
+                      final Paint p = paint(px, wt, false, color, Paint.Align.CENTER);
+                      ops.add(c -> text(c, p, line, W / 2f, yy));
+                      y += lh(px);
+                  }
+              }
+
+              private void blockText(String text, float px, int wt, boolean italic, boolean center) {
+                  setFont(measure, px, wt, italic);
+                  for (String t : wrap(measure, text, CW)) {
+                      final float yy = y;
+                      final String line = t;
+                      final Paint p = paint(px, wt, italic, Color.BLACK, center ? Paint.Align.CENTER : Paint.Align.LEFT);
+                      ops.add(c -> text(c, p, line, center ? W / 2f : PAD, yy));
+                      y += lh(px);
+                  }
+              }
+
+              private void dashed() {
+                  final float yy = y + Math.round(4 * S);
+                  final Paint p = new Paint();
+                  p.setColor(Color.BLACK);
+                  p.setStyle(Paint.Style.STROKE);
+                  p.setStrokeWidth(Math.max(2, Math.round(1.5f * S)));
+                  p.setPathEffect(new DashPathEffect(new float[]{Math.round(4 * S), Math.round(3 * S)}, 0));
+                  ops.add(c -> c.drawLine(PAD, yy, W - PAD, yy, p));
+                  y += Math.round(9 * S);
+              }
+
+              private void rowLR(String left, String right, float px, int wtL, int wtR, int gapAfter, boolean fitOneLine) {
+                  if (fitOneLine) {
+                      float p = px;
+                      while (p > px * 0.6f) {
+                          setFont(measure, p, wtL, false); float a = measure.measureText(left);
+                          setFont(measure, p, wtR, false); float b = measure.measureText(right);
+                          if (a + b + 6 <= CW) break;
+                          p -= 0.25f;
+                      }
+                      px = p;
+                  }
+                  setFont(measure, px, wtL, false);
+                  float lw = measure.measureText(left);
+                  setFont(measure, px, wtR, false);
+                  final List<String> rl = fitOneLine ? new ArrayList<String>() : wrap(measure, right, CW - lw - 8 * S);
+                  if (fitOneLine) rl.add(right);
+                  final float yy = y;
+                  final Paint pl = paint(px, wtL, false, Color.BLACK, Paint.Align.LEFT);
+                  final Paint pr = paint(px, wtR, false, Color.BLACK, Paint.Align.RIGHT);
+                  final int lineH = lh(px);
+                  final String leftText = left;
+                  ops.add(c -> {
+                      text(c, pl, leftText, PAD, yy);
+                      for (int i = 0; i < rl.size(); i++) text(c, pr, rl.get(i), W - PAD, yy + i * lineH);
+                  });
+                  y += Math.max(1, rl.size()) * lineH + gapAfter;
+              }
+
+              // ---------- susun & ubah ke ESC/POS ----------
+              private byte[] build(JSONObject r) throws Exception {
+                  centerText(r.optString("store"), 19, 800, Color.BLACK);
+
+                  // alamat toko: satu baris, huruf mengecil sampai muat
+                  String addr = r.optString("address").replaceAll("\\s+", " ").trim();
+                  float ap = 11;
+                  while (ap > 6) {
+                      setFont(measure, ap, 400, false);
+                      if (measure.measureText(addr) <= CW) break;
+                      ap -= 0.25f;
+                  }
+                  final float addrPx = ap;
+                  final String addrText = addr;
+                  final float ay = y;
+                  final Paint addrPaint = paint(addrPx, 400, false, Color.parseColor("#222222"), Paint.Align.CENTER);
+                  ops.add(c -> text(c, addrPaint, addrText, W / 2f, ay));
+                  y += lh(addrPx);
+
+                  centerText(r.optString("wa"), 11, 400, Color.parseColor("#222222"));
+                  dashed();
+
+                  JSONArray info = r.optJSONArray("info");
+                  if (info != null) for (int i = 0; i < info.length(); i++) {
+                      JSONArray p = info.getJSONArray(i);
+                      rowLR(p.getString(0), p.getString(1), 12.5f, 600, 700, 1, "Invoice".equals(p.getString(0)));
+                  }
+                  dashed();
+
+                  JSONArray items = r.optJSONArray("items");
+                  if (items != null) for (int i = 0; i < items.length(); i++) {
+                      JSONObject x = items.getJSONObject(i);
+                      blockText(x.optString("nama"), 13.5f, 700, false, false);
+                      rowLR(x.optString("qty"), x.optString("subtotal"), 12.5f, 400, 700, 3, false);
+                  }
+                  dashed();
+                  rowLR("TOTAL", r.optString("total"), 16, 800, 800, 0, false);
+                  dashed();
+
+                  JSONArray pay = r.optJSONArray("pay");
+                  if (pay != null) for (int i = 0; i < pay.length(); i++) {
+                      JSONArray p = pay.getJSONArray(i);
+                      rowLR(p.getString(0), p.getString(1), 12.5f, 600, 600, 0, false);
+                  }
+
+                  String note = r.optString("note");
+                  if (!note.isEmpty()) {
+                      dashed();
+                      blockText("Catatan:", 12, 700, false, false);
+                      blockText("\"" + note + "\"", 12, 400, true, false);
+                  }
+                  String reward = r.optString("reward");
+                  if (!reward.isEmpty()) {
+                      dashed();
+                      blockText("\uD83C\uDF89 SELAMAT! HADIAH GAME \uD83C\uDF81", 12.5f, 800, false, true);
+                      blockText(reward, 12.5f, 700, false, true);
+                  } else if (r.optBoolean("played", false)) {
+                      dashed();
+                      blockText("\uD83C\uDFAE TERIMA KASIH SUDAH BERMAIN!", 12.5f, 800, false, true);
+                      blockText("Belum beruntung kali ini, yuk main lagi & jadilah juara! \uD83C\uDFC6", 11.5f, 700, false, true);
+                  }
+                  dashed();
+                  centerText("\uD83C\uDF10 " + r.optString("website"), 11, 600, Color.parseColor("#333333"));
+                  y += Math.round(5 * S);
+                  centerText("Terima Kasih atas Kunjungan Anda! \uD83D\uDE4F", 12.5f, 700, Color.BLACK);
+
+                  int h = (int) y + 4;
+                  Bitmap bmp = Bitmap.createBitmap(W, h, Bitmap.Config.ARGB_8888);
+                  Canvas canvas = new Canvas(bmp);
+                  canvas.drawColor(Color.WHITE);
+                  for (Op op : ops) op.draw(canvas);
+                  int[] px = new int[W * h];
+                  bmp.getPixels(px, 0, W, 0, 0, W, h);
+                  bmp.recycle();
+
+                  ByteArrayOutputStream out = new ByteArrayOutputStream();
+                  out.write(0x1B); out.write(0x40); // reset printer
+                  int bpr = W / 8;
+                  for (int y0 = 0; y0 < h; y0 += 128) {
+                      int rows = Math.min(128, h - y0);
+                      out.write(0x1D); out.write(0x76); out.write(0x30); out.write(0x00);
+                      out.write(bpr & 255); out.write(bpr >> 8);
+                      out.write(rows & 255); out.write(rows >> 8);
+                      for (int yy = y0; yy < y0 + rows; yy++) {
+                          for (int bx = 0; bx < bpr; bx++) {
+                              int b = 0;
+                              for (int k = 0; k < 8; k++) {
+                                  int c = px[yy * W + bx * 8 + k];
+                                  double lum = 0.299 * Color.red(c) + 0.587 * Color.green(c) + 0.114 * Color.blue(c);
+                                  if (lum < 165) b |= (0x80 >> k);
+                              }
+                              out.write(b);
+                          }
+                      }
+                  }
+                  out.write(0x1B); out.write(0x4A); out.write(40); // sedikit dorong kertas
+                  return out.toByteArray();
+              }
+          }
+          HARIN_EOF
           mkdir -p app/src/main/res/mipmap-xxxhdpi
           ICON_ATTR=""
           if curl -fsSL --max-time 30 https://harinfood.mra.my.id/icon-192.png -o app/src/main/res/mipmap-xxxhdpi/ic_launcher.png && [ "$(stat -c%s app/src/main/res/mipmap-xxxhdpi/ic_launcher.png)" -gt 1000 ]; then
@@ -517,6 +1036,10 @@ jobs:
 
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
               <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
               <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
               <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
@@ -541,6 +1064,11 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+
+                  <service
+                      android:name=".PrintService"
+                      android:exported="false"
+                      android:foregroundServiceType="connectedDevice" />
               </application>
           </manifest>
           HARIN_EOF2
