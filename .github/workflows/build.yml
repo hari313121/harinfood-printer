@@ -1,0 +1,370 @@
+# HARINFOOD PRINTER - satu berkas ini membuat dan membangun aplikasi Android (APK) otomatis di GitHub.
+# Simpan sebagai: .github/workflows/build.yml
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Buat berkas proyek Android
+        run: |
+          set -e
+          # Bersihkan sisa berkas yang salah folder (kalau ada), lalu buat ulang proyek dengan susunan yang benar
+          rm -rf app build.gradle settings.gradle gradle.properties
+          cat > build.gradle <<'HARIN_EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          HARIN_EOF
+          cat > settings.gradle <<'HARIN_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "HarinfoodPrinter"
+          include ':app'
+          HARIN_EOF
+          cat > gradle.properties <<'HARIN_EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          HARIN_EOF
+          mkdir -p app
+          cat > app/build.gradle <<'HARIN_EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'id.my.mra.harinfoodprinter'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "id.my.mra.harinfoodprinter"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 2
+                  versionName "1.1"
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+
+          dependencies {
+              implementation 'com.google.android.gms:play-services-location:21.3.0'
+          }
+          HARIN_EOF
+          mkdir -p app/src/main/java/id/my/mra/harinfoodprinter
+          cat > app/src/main/java/id/my/mra/harinfoodprinter/MainActivity.java <<'HARIN_EOF'
+          package id.my.mra.harinfoodprinter;
+
+          import android.Manifest;
+          import android.annotation.SuppressLint;
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.net.Uri;
+          import android.provider.Settings;
+          import android.os.Bundle;
+          import android.view.KeyEvent;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.webkit.GeolocationPermissions;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.Toast;
+
+          import com.google.android.gms.common.api.ResolvableApiException;
+          import com.google.android.gms.location.LocationRequest;
+          import com.google.android.gms.location.LocationServices;
+          import com.google.android.gms.location.LocationSettingsRequest;
+          import com.google.android.gms.location.Priority;
+
+          /**
+           * Pembungkus (WebView) untuk HARINFOOD POS.
+           * Menyediakan window.HarinPrint.print(base64) ke halaman web, sehingga struk bisa dikirim ke aplikasi RawBT
+           * TANPA sentuhan layar (Chrome memblokir hal ini, WebView aplikasi tidak).
+           */
+          public class MainActivity extends Activity {
+
+              // Ganti kalau alamat aplikasi Anda berubah
+              private static final String START_URL = "https://harinfood.mra.my.id/";
+              private static final int FILE_CHOOSER_REQ = 4711;
+              private static final int GPS_RESOLVE_REQ = 4712;
+              private static final int LOCATION_PERM_REQ = 4713;
+
+              private WebView webView;
+              private ValueCallback<Uri[]> filePathCallback;
+
+              // Izin lokasi untuk halaman web (navigator.geolocation) & permintaan "aktifkan GPS"
+              private GeolocationPermissions.Callback geoCallback;
+              private String geoOrigin;
+              private boolean pendingEnableGps = false;
+
+              private boolean hasLocationPermission() {
+                  return checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                      || checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+              }
+
+              private void askLocationPermission() {
+                  requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION}, LOCATION_PERM_REQ);
+              }
+
+              /** Kabari halaman web hasil permintaan aktifkan GPS. */
+              private void notifyGps(final boolean ok) {
+                  webView.post(() -> webView.evaluateJavascript("window.__harinGpsResult && window.__harinGpsResult(" + ok + ")", null));
+              }
+
+              /** Tampilkan dialog sistem Google "Aktifkan lokasi?" (satu ketukan OK menyalakan GPS). Cadangan: buka Pengaturan Lokasi. */
+              private void checkAndEnableGps() {
+                  try {
+                      LocationRequest req = new LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 10000).build();
+                      LocationSettingsRequest settingsReq = new LocationSettingsRequest.Builder().addLocationRequest(req).setAlwaysShow(true).build();
+                      LocationServices.getSettingsClient(this).checkLocationSettings(settingsReq)
+                          .addOnSuccessListener(r -> notifyGps(true))
+                          .addOnFailureListener(e -> {
+                              if (e instanceof ResolvableApiException) {
+                                  try {
+                                      ((ResolvableApiException) e).startResolutionForResult(MainActivity.this, GPS_RESOLVE_REQ);
+                                  } catch (Exception ex) { openLocationSettings(); }
+                              } else { openLocationSettings(); }
+                          });
+                  } catch (Throwable t) { openLocationSettings(); }
+              }
+
+              private void openLocationSettings() {
+                  try {
+                      Intent i = new Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS);
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      startActivity(i);
+                  } catch (Exception e) { /* abaikan */ }
+                  notifyGps(false);
+              }
+
+              /** Jembatan JavaScript -> Android untuk GPS. */
+              private class GpsBridge {
+                  @JavascriptInterface
+                  public void enable() {
+                      runOnUiThread(() -> {
+                          if (!hasLocationPermission()) { pendingEnableGps = true; askLocationPermission(); }
+                          else checkAndEnableGps();
+                      });
+                  }
+              }
+
+              /** Jembatan JavaScript -> Android. */
+              private class PrintBridge {
+                  @JavascriptInterface
+                  public boolean print(String base64Data) {
+                      try {
+                          Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse("rawbt:base64," + base64Data));
+                          i.addCategory(Intent.CATEGORY_BROWSABLE);
+                          i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          startActivity(i);
+                          return true;
+                      } catch (Exception e) {
+                          return false;
+                      }
+                  }
+              }
+
+              @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  // Layar tetap menyala selama aplikasi terbuka (supaya pesanan bisa tercetak otomatis)
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
+                  webView = new WebView(this);
+                  setContentView(webView);
+
+                  WebSettings st = webView.getSettings();
+                  st.setJavaScriptEnabled(true);
+                  st.setDomStorageEnabled(true);
+                  st.setMediaPlaybackRequiresUserGesture(false);
+                  st.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
+                  st.setAllowFileAccess(false);
+
+                  webView.addJavascriptInterface(new PrintBridge(), "HarinPrint");
+                  webView.addJavascriptInterface(new GpsBridge(), "HarinGps");
+                  st.setGeolocationEnabled(true);
+
+                  webView.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView view, android.webkit.WebResourceRequest request) {
+                          Uri u = request.getUrl();
+                          String scheme = u.getScheme() == null ? "" : u.getScheme();
+                          if (scheme.equals("http") || scheme.equals("https")) return false; // tetap di dalam aplikasi
+                          try { // tel:, wa.me, intent:, dsb. dibuka aplikasi lain
+                              Intent i = new Intent(Intent.ACTION_VIEW, u);
+                              i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                              startActivity(i);
+                          } catch (Exception e) {
+                              Toast.makeText(MainActivity.this, "Tidak ada aplikasi untuk membuka tautan ini", Toast.LENGTH_SHORT).show();
+                          }
+                          return true;
+                      }
+                  });
+
+                  // Dukungan pilih berkas/foto (mis. unggah gambar produk)
+                  webView.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public void onGeolocationPermissionsShowPrompt(String origin, GeolocationPermissions.Callback callback) {
+                          if (hasLocationPermission()) { callback.invoke(origin, true, false); return; }
+                          geoCallback = callback; geoOrigin = origin;
+                          askLocationPermission();
+                      }
+
+                      @Override
+                      public boolean onShowFileChooser(WebView w, ValueCallback<Uri[]> callback, FileChooserParams params) {
+                          if (filePathCallback != null) filePathCallback.onReceiveValue(null);
+                          filePathCallback = callback;
+                          try {
+                              startActivityForResult(params.createIntent(), FILE_CHOOSER_REQ);
+                          } catch (Exception e) {
+                              filePathCallback = null;
+                              return false;
+                          }
+                          return true;
+                      }
+                  });
+
+                  if (savedInstanceState != null) webView.restoreState(savedInstanceState);
+                  else webView.loadUrl(START_URL);
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                  if (requestCode != LOCATION_PERM_REQ) return;
+                  boolean granted = false;
+                  for (int r : grantResults) if (r == PackageManager.PERMISSION_GRANTED) granted = true;
+                  if (geoCallback != null) { geoCallback.invoke(geoOrigin, granted, false); geoCallback = null; geoOrigin = null; }
+                  if (pendingEnableGps) {
+                      pendingEnableGps = false;
+                      if (granted) checkAndEnableGps(); else notifyGps(false);
+                  }
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  if (requestCode == GPS_RESOLVE_REQ) { notifyGps(resultCode == RESULT_OK); return; }
+                  if (requestCode == FILE_CHOOSER_REQ && filePathCallback != null) {
+                      filePathCallback.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data));
+                      filePathCallback = null;
+                      return;
+                  }
+                  super.onActivityResult(requestCode, resultCode, data);
+              }
+
+              @Override
+              protected void onSaveInstanceState(Bundle outState) {
+                  super.onSaveInstanceState(outState);
+                  webView.saveState(outState);
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  webView.onResume();
+              }
+
+              @Override
+              public boolean onKeyDown(int keyCode, KeyEvent event) {
+                  if (keyCode == KeyEvent.KEYCODE_BACK && webView.canGoBack()) {
+                      webView.goBack();
+                      return true;
+                  }
+                  return super.onKeyDown(keyCode, event);
+              }
+          }
+          HARIN_EOF
+          mkdir -p app/src/main/res/mipmap-xxxhdpi
+          ICON_ATTR=""
+          if curl -fsSL --max-time 30 https://harinfood.mra.my.id/icon-192.png -o app/src/main/res/mipmap-xxxhdpi/ic_launcher.png && [ "$(stat -c%s app/src/main/res/mipmap-xxxhdpi/ic_launcher.png)" -gt 1000 ]; then
+            ICON_ATTR='android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher"'
+          else
+            rm -f app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+          fi
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<HARIN_EOF2
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Harinfood Printer"
+                  ${ICON_ATTR}
+                  android:usesCleartextTraffic="false"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout"
+                      android:launchMode="singleTask"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          HARIN_EOF2
+          echo "== Proyek siap =="; find . -type f -not -path "./.git/*" -not -path "./.github/*" | sort
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Pasang komponen Android SDK
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HarinfoodPrinter-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
