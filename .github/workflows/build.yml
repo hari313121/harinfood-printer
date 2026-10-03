@@ -16,6 +16,8 @@ jobs:
       - name: Buat berkas proyek Android
         run: |
           set -e
+          # Bersihkan sisa berkas yang salah folder (kalau ada), lalu buat ulang proyek dengan susunan yang benar
+          rm -rf app build.gradle settings.gradle gradle.properties
           cat > build.gradle <<'HARIN_EOF'
           plugins {
               id 'com.android.application' version '8.5.2' apply false
