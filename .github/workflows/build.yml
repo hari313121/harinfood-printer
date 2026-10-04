@@ -1,4 +1,4 @@
-# HARINFOOD PRINTER v1.7 - satu berkas ini membuat dan membangun aplikasi Android (APK) otomatis di GitHub.
+# HARINFOOD PRINTER v1.8 - satu berkas ini membuat dan membangun aplikasi Android (APK) otomatis di GitHub.
 # Simpan sebagai: .github/workflows/build.yml
 name: Build APK
 
@@ -59,8 +59,8 @@ jobs:
                   applicationId "id.my.mra.harinfoodprinter"
                   minSdk 24
                   targetSdk 34
-                  versionCode 8
-                  versionName "1.7"
+                  versionCode 9
+                  versionName "1.8"
               }
 
               buildTypes {
@@ -1130,7 +1130,7 @@ jobs:
                           }
                       }
                   }
-                  out.write(0x1B); out.write(0x4A); out.write(60); // dorong kertas ~7,5 mm agar baris terakhir tidak terpotong
+                  out.write(0x1B); out.write(0x4A); out.write(88); // dorong kertas ~11 mm agar baris terakhir tidak terpotong
                   return out.toByteArray();
               }
           }
