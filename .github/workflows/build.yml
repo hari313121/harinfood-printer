@@ -1,4 +1,4 @@
-# HARINFOOD PRINTER v1.8 - satu berkas ini membuat dan membangun aplikasi Android (APK) otomatis di GitHub.
+# HARINFOOD PRINTER v1.9 - satu berkas ini membuat dan membangun aplikasi Android (APK) otomatis di GitHub.
 # Simpan sebagai: .github/workflows/build.yml
 name: Build APK
 
@@ -59,8 +59,8 @@ jobs:
                   applicationId "id.my.mra.harinfoodprinter"
                   minSdk 24
                   targetSdk 34
-                  versionCode 9
-                  versionName "1.8"
+                  versionCode 10
+                  versionName "1.9"
               }
 
               buildTypes {
@@ -986,7 +986,10 @@ jobs:
 
               private void blockText(String text, float px, int wt, boolean italic, boolean center) {
                   setFont(measure, px, wt, italic);
-                  for (String t : wrap(measure, text, CW)) {
+                  // Tiap baris (Enter) dipertahankan sebagai baris baru; baris panjang tetap dibungkus otomatis
+                  List<String> lines = new ArrayList<String>();
+                  for (String par : text.split("\\r?\\n")) lines.addAll(wrap(measure, par, CW));
+                  for (String t : lines) {
                       final float yy = y;
                       final String line = t;
                       final Paint p = paint(px, wt, italic, Color.BLACK, center ? Paint.Align.CENTER : Paint.Align.LEFT);
