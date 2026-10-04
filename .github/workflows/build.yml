@@ -1,4 +1,4 @@
-# HARINFOOD PRINTER v1.4 - satu berkas ini membuat dan membangun aplikasi Android (APK) otomatis di GitHub.
+# HARINFOOD PRINTER v1.5 - satu berkas ini membuat dan membangun aplikasi Android (APK) otomatis di GitHub.
 # Simpan sebagai: .github/workflows/build.yml
 name: Build APK
 
@@ -59,8 +59,8 @@ jobs:
                   applicationId "id.my.mra.harinfoodprinter"
                   minSdk 24
                   targetSdk 34
-                  versionCode 5
-                  versionName "1.4"
+                  versionCode 6
+                  versionName "1.5"
               }
 
               buildTypes {
@@ -593,6 +593,8 @@ jobs:
           import android.content.Intent;
           import android.content.SharedPreferences;
           import android.content.pm.ServiceInfo;
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
           import android.os.Build;
           import android.os.IBinder;
           import android.os.PowerManager;
@@ -722,6 +724,26 @@ jobs:
                   }
               }
 
+              private static Bitmap logoBmp = null;
+
+              /** Unduh logo kedai sekali saja (dipakai bila pengaturan "Logo & Header di Struk" aktif). */
+              private Bitmap logo(String cookie) {
+                  if (logoBmp != null) return logoBmp;
+                  try {
+                      HttpURLConnection c = (HttpURLConnection) new URL(BASE + "icon-192.png").openConnection();
+                      c.setConnectTimeout(8000);
+                      c.setReadTimeout(8000);
+                      if (cookie != null) c.setRequestProperty("Cookie", cookie);
+                      InputStream in = c.getInputStream();
+                      Bitmap b = BitmapFactory.decodeStream(in);
+                      in.close();
+                      logoBmp = b;
+                      return b;
+                  } catch (Exception e) {
+                      return null;
+                  }
+              }
+
               /** Mengembalikan false bila pencetakan gagal (supaya jeda lebih lama sebelum mencoba lagi). */
               private boolean processOrder(int id, String cookie) throws Exception {
                   JSONObject res = http("POST", BASE + "api.php?action=claim_auto_print", "id=" + id, cookie);
@@ -732,7 +754,9 @@ jobs:
 
                   byte[] bytes;
                   try {
-                      bytes = ReceiptRenderer.render(d.getJSONObject("receipt"));
+                      JSONObject rcp = d.getJSONObject("receipt");
+                      Bitmap lg = rcp.optBoolean("logo", false) ? logo(cookie) : null;
+                      bytes = ReceiptRenderer.render(rcp, lg);
                   } catch (Exception e) {
                       bytes = Base64.decode(d.getString("escpos"), Base64.DEFAULT); // cadangan: struk teks
                   }
@@ -788,6 +812,7 @@ jobs:
           import android.graphics.Color;
           import android.graphics.DashPathEffect;
           import android.graphics.Paint;
+          import android.graphics.RectF;
           import android.graphics.Typeface;
 
           import org.json.JSONArray;
@@ -811,7 +836,94 @@ jobs:
               private float y = 6;
 
               public static byte[] render(JSONObject r) throws Exception {
-                  return new ReceiptRenderer().build(r);
+                  return new ReceiptRenderer().build(r, null);
+              }
+
+              /** logo = gambar logo kedai (boleh null). Dipakai hanya kalau pengaturan "Logo & Header di Struk" aktif. */
+              public static byte[] render(JSONObject r, Bitmap logo) throws Exception {
+                  return new ReceiptRenderer().build(r, logo);
+              }
+
+              // ---------- logo (dithering hitam-putih supaya halus di printer thermal) ----------
+              private static Bitmap ditherLogo(Bitmap src, int size) {
+                  Bitmap scaled = Bitmap.createScaledBitmap(src, size, size, true);
+                  Bitmap flat = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
+                  Canvas cv = new Canvas(flat);
+                  cv.drawColor(Color.WHITE);
+                  cv.drawBitmap(scaled, 0, 0, null);
+                  int[] px = new int[size * size];
+                  flat.getPixels(px, 0, size, 0, 0, size, size);
+                  float[] g = new float[size * size];
+                  for (int i = 0; i < g.length; i++) {
+                      float lum = 0.299f * Color.red(px[i]) + 0.587f * Color.green(px[i]) + 0.114f * Color.blue(px[i]);
+                      g[i] = Math.min(255f, lum * 1.25f + 25f);
+                  }
+                  for (int yy = 0; yy < size; yy++) {
+                      for (int xx = 0; xx < size; xx++) {
+                          int i = yy * size + xx;
+                          float old = g[i];
+                          float nw = old < 128f ? 0f : 255f;
+                          float err = old - nw;
+                          g[i] = nw;
+                          if (xx + 1 < size) g[i + 1] += err * 7f / 16f;
+                          if (yy + 1 < size) {
+                              if (xx > 0) g[i + size - 1] += err * 3f / 16f;
+                              g[i + size] += err * 5f / 16f;
+                              if (xx + 1 < size) g[i + size + 1] += err * 1f / 16f;
+                          }
+                      }
+                  }
+                  for (int i = 0; i < g.length; i++) px[i] = g[i] < 128f ? Color.BLACK : Color.WHITE;
+                  flat.setPixels(px, 0, size, 0, 0, size, size);
+                  return flat;
+              }
+
+              /** Header berlogo: logo di kiri; nama + lencana POS + tagline di kanan. */
+              private void logoHeader(JSONObject r, Bitmap logo) {
+                  final int ls = 84;
+                  final float tx = PAD + ls + 10;
+                  final float aw = W - PAD - tx;
+                  final float y0 = y;
+                  final String title = r.optString("header_title", r.optString("store"));
+                  final String badge = r.optString("header_badge", "");
+                  float np = 19f;
+                  float nameW = 0f;
+                  float bw = 0f;
+                  while (true) {
+                      setFont(measure, np, 800, false);
+                      nameW = measure.measureText(title);
+                      setFont(measure, 9, 800, false);
+                      bw = badge.isEmpty() ? 0f : measure.measureText(badge) + 12f;
+                      if (nameW + (badge.isEmpty() ? 0f : 8f + bw) <= aw || np <= 11f) break;
+                      np -= 0.5f;
+                  }
+                  setFont(measure, 11, 400, false);
+                  final List<String> tag = wrap(measure, r.optString("header_tagline", ""), aw);
+                  final int blockH = lh(np) + tag.size() * lh(11);
+                  final float ty = y0 + Math.max(0, Math.round((ls - blockH) / 2f));
+                  final Bitmap dith = ditherLogo(logo, ls);
+                  final float npF = np, nameWF = nameW, bwF = bw;
+                  final Paint pTitle = paint(npF, 800, false, Color.BLACK, Paint.Align.LEFT);
+                  final Paint pBadge = paint(9, 800, false, Color.BLACK, Paint.Align.LEFT);
+                  final Paint pTag = paint(11, 400, false, Color.parseColor("#222222"), Paint.Align.LEFT);
+                  final Paint pStroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  pStroke.setColor(Color.BLACK);
+                  pStroke.setStyle(Paint.Style.STROKE);
+                  pStroke.setStrokeWidth(2f);
+                  final int titleH = lh(npF);
+                  ops.add(c -> {
+                      c.drawBitmap(dith, PAD, y0, null);
+                      text(c, pTitle, title, tx, ty);
+                      if (!badge.isEmpty()) {
+                          float bx = tx + nameWF + 8f;
+                          float bh = Math.round(9 * S * 1.35f);
+                          float by = ty + Math.round((titleH - bh) / 2f);
+                          c.drawRoundRect(new RectF(bx, by, bx + bwF, by + bh), 4f, 4f, pStroke);
+                          text(c, pBadge, badge, bx + 6f, by + Math.round((bh - 9 * S) / 2f) - 1);
+                      }
+                      for (int i = 0; i < tag.size(); i++) text(c, pTag, tag.get(i), tx, ty + titleH + i * lh(11));
+                  });
+                  y = y0 + Math.max(ls, blockH) + 4;
               }
 
               // ---------- huruf ----------
@@ -923,8 +1035,9 @@ jobs:
               }
 
               // ---------- susun & ubah ke ESC/POS ----------
-              private byte[] build(JSONObject r) throws Exception {
-                  centerText(r.optString("store"), 19, 800, Color.BLACK);
+              private byte[] build(JSONObject r, Bitmap logo) throws Exception {
+                  if (r.optBoolean("logo", false) && logo != null) logoHeader(r, logo);
+                  else centerText(r.optString("store"), 19, 800, Color.BLACK);
 
                   // alamat toko: satu baris, huruf mengecil sampai muat
                   String addr = r.optString("address").replaceAll("\\s+", " ").trim();
