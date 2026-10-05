@@ -1,4 +1,4 @@
-# HARINFOOD PRINTER v1.9 - satu berkas ini membuat dan membangun aplikasi Android (APK) otomatis di GitHub.
+# HARINFOOD PRINTER v2.0 - satu berkas ini membuat dan membangun aplikasi Android (APK) otomatis di GitHub.
 # Simpan sebagai: .github/workflows/build.yml
 name: Build APK
 
@@ -59,8 +59,8 @@ jobs:
                   applicationId "id.my.mra.harinfoodprinter"
                   minSdk 24
                   targetSdk 34
-                  versionCode 10
-                  versionName "1.9"
+                  versionCode 11
+                  versionName "2.0"
               }
 
               buildTypes {
@@ -83,6 +83,26 @@ jobs:
           package id.my.mra.harinfoodprinter;
 
           import android.Manifest;
+          import android.app.DownloadManager;
+          import android.content.ContentValues;
+          import android.graphics.Color;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.view.Gravity;
+          import android.view.ViewGroup;
+          import android.webkit.CookieManager;
+          import android.webkit.DownloadListener;
+          import android.webkit.PermissionRequest;
+          import android.webkit.URLUtil;
+          import android.webkit.WebResourceRequest;
+          import android.widget.Button;
+          import android.widget.FrameLayout;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.OutputStream;
+
           import android.annotation.SuppressLint;
           import android.app.Activity;
           import android.bluetooth.BluetoothAdapter;
@@ -137,6 +157,9 @@ jobs:
               private static final int GPS_RESOLVE_REQ = 4712;
               private static final int LOCATION_PERM_REQ = 4713;
               private static final int BT_PERM_REQ = 4714;
+              private static final int CAMERA_PERM_REQ = 4715;
+              private static final String HOST = "harinfood.mra.my.id";
+              private static final int KIND_EXTERNAL = 0, KIND_AUTOPRINT = 1, KIND_VISIBLE = 2, KIND_DOWNLOAD = 3;
 
               private WebView webView;
               private ValueCallback<Uri[]> filePathCallback;
@@ -324,17 +347,38 @@ jobs:
                   }
               }
 
-              // ---- Cetak manual (tombol "Cetak Struk", kartu member, laporan, dll) ----
-              // WebView tidak mendukung window.open()/window.print(), jadi halaman print_*.php dimuat di WebView tersembunyi
-              // lalu dikirim ke dialog cetak Android (pilih RawBT Print Service seperti biasa).
+              // ================= Jendela tambahan (window.open), cetak, & unduhan =================
+              // WebView tidak mendukung window.open()/window.print()/unduhan blob seperti Chrome, jadi semuanya dijembatani di sini:
+              //  - halaman struk (print_order, print_note, ...)      : dimuat tersembunyi lalu langsung dikirim ke dialog cetak Android
+              //  - halaman interaktif (kartu nama, kartu member, laporan): ditampilkan penuh dengan tombol "Tutup"; window.print() & unduh PDF dijembatani
+              //  - export_*.php (CSV/Excel)                            : diunduh lewat DownloadManager dengan sesi login kasir
+              //  - alamat lain (WhatsApp, dll)                         : dibuka di aplikasi lain
+              private FrameLayout root;
               private WebView printView;
+              private LinearLayout popupContainer;
+              private PermissionRequest pendingPermRequest;
 
-              private boolean isPrintUrl(String url) {
-                  if (url == null) return false;
+              private static final String HOOK_JS = "(function(){if(window.__harinHook)return;window.__harinHook=true;"
+                  + "window.print=function(){HarinNative.printPage();};"
+                  + "function send(u,n){var x=new XMLHttpRequest();x.open('GET',u);x.responseType='blob';"
+                  + "x.onload=function(){var r=new FileReader();r.onloadend=function(){HarinNative.saveDataUrl(String(r.result),n||'berkas');};r.readAsDataURL(x.response);};"
+                  + "x.onerror=function(){HarinNative.toast('Gagal membaca berkas');};x.send();}"
+                  + "function grab(a){try{if(a&&a.tagName==='A'&&a.download&&a.href&&a.href.indexOf('blob:')===0){send(a.href,a.download);return true;}}catch(e){}return false;}"
+                  + "var oc=HTMLAnchorElement.prototype.click;HTMLAnchorElement.prototype.click=function(){if(grab(this))return;return oc.apply(this,arguments);};"
+                  + "var od=EventTarget.prototype.dispatchEvent;EventTarget.prototype.dispatchEvent=function(e){if(e&&e.type==='click'&&grab(this))return true;return od.apply(this,arguments);};"
+                  + "})();";
+
+              private int classifyUrl(String url) {
+                  if (url == null) return KIND_EXTERNAL;
                   Uri u = Uri.parse(url);
                   String host = u.getHost() == null ? "" : u.getHost();
                   String path = u.getPath() == null ? "" : u.getPath();
-                  return host.equals("harinfood.mra.my.id") && path.contains("print_");
+                  if (!host.equals(HOST)) return KIND_EXTERNAL;
+                  String file = path.substring(path.lastIndexOf('/') + 1);
+                  if (file.startsWith("export_")) return KIND_DOWNLOAD;
+                  if (file.equals("print_order.php") || file.equals("print_note.php")
+                      || file.equals("print_game_proof.php") || file.equals("print_member_card.php")) return KIND_AUTOPRINT;
+                  return KIND_VISIBLE; // kartu nama kedai, semua kartu member, laporan harian, gambar QRIS, dll
               }
 
               private void openExternal(String url) {
@@ -357,6 +401,197 @@ jobs:
                   }
               }
 
+              /** Tampilkan jendela tambahan memenuhi layar dengan tombol Tutup di atas. */
+              private void showPopupOverlay(WebView popup) {
+                  if (popupContainer != null || root == null) return;
+                  LinearLayout box = new LinearLayout(this);
+                  box.setOrientation(LinearLayout.VERTICAL);
+                  box.setBackgroundColor(Color.WHITE);
+                  LinearLayout bar = new LinearLayout(this);
+                  bar.setOrientation(LinearLayout.HORIZONTAL);
+                  bar.setGravity(Gravity.CENTER_VERTICAL);
+                  bar.setBackgroundColor(Color.parseColor("#F97316"));
+                  bar.setPadding(24, 8, 16, 8);
+                  TextView title = new TextView(this);
+                  title.setText("Harinfood");
+                  title.setTextColor(Color.WHITE);
+                  title.setTextSize(16);
+                  Button close = new Button(this);
+                  close.setText("✕ Tutup");
+                  close.setOnClickListener(v -> closePopupOverlay());
+                  bar.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                  bar.addView(close, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                  box.addView(bar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                  box.addView(popup, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+                  root.addView(box, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                  popupContainer = box;
+              }
+
+              private void closePopupOverlay() {
+                  if (popupContainer != null) {
+                      root.removeView(popupContainer);
+                      popupContainer = null;
+                  }
+                  if (printView != null) {
+                      try { printView.destroy(); } catch (Exception ignored) {}
+                      printView = null;
+                  }
+              }
+
+              /** Klien untuk jendela tambahan: menentukan apakah dicetak otomatis, ditampilkan, diunduh, atau dibuka di aplikasi lain. */
+              private class PopupClient extends WebViewClient {
+                  private boolean routed = false;
+                  private boolean printed = false;
+                  private int kind = KIND_AUTOPRINT;
+
+                  private boolean route(WebView v, String url) {
+                      if (url == null || url.equals("about:blank") || routed) return false;
+                      routed = true;
+                      kind = classifyUrl(url);
+                      if (kind == KIND_EXTERNAL) { openExternal(url); return true; }
+                      if (kind == KIND_VISIBLE) showPopupOverlay(v);
+                      return false;
+                  }
+
+                  @Override
+                  public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest request) {
+                      return route(v, request.getUrl().toString());
+                  }
+
+                  @Override
+                  public void onPageStarted(WebView v, String url, Bitmap favicon) {
+                      if (route(v, url)) v.stopLoading();
+                  }
+
+                  @Override
+                  public void onPageFinished(final WebView v, String url) {
+                      if (kind == KIND_VISIBLE) { v.evaluateJavascript(HOOK_JS, null); return; }
+                      if (printed || kind == KIND_DOWNLOAD || kind == KIND_EXTERNAL) return;
+                      // AUTOPRINT atau about:blank (jendela kosong yang isinya ditulis lewat JavaScript, mis. struk offline)
+                      printed = true;
+                      v.postDelayed(() -> doSystemPrint(v, "Harinfood"), 900);
+                  }
+              }
+
+              private WebView buildPopup() {
+                  final WebView p = new WebView(this);
+                  WebSettings ps = p.getSettings();
+                  ps.setJavaScriptEnabled(true);
+                  ps.setDomStorageEnabled(true);
+                  ps.setUseWideViewPort(true);
+                  ps.setLoadWithOverviewMode(true);
+                  ps.setBuiltInZoomControls(true);
+                  ps.setDisplayZoomControls(false);
+                  ps.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
+                  p.addJavascriptInterface(new NativeBridge(p), "HarinNative");
+                  p.setDownloadListener(downloadListener(p));
+                  p.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public void onCloseWindow(WebView w) { closePopupOverlay(); }
+                  });
+                  p.setWebViewClient(new PopupClient());
+                  return p;
+              }
+
+              // ---- Unduhan ----
+              private DownloadListener downloadListener(final WebView src) {
+                  return (url, userAgent, contentDisposition, mimetype, contentLength) ->
+                      handleDownload(src, url, userAgent, contentDisposition, mimetype);
+              }
+
+              private void handleDownload(final WebView src, String url, String ua, String cd, String mime) {
+                  final String name = URLUtil.guessFileName(url, cd, mime);
+                  if (url.startsWith("blob:")) {
+                      final String js = "(function(){var x=new XMLHttpRequest();x.open('GET'," + JSONObject.quote(url) + ");x.responseType='blob';"
+                          + "x.onload=function(){var r=new FileReader();r.onloadend=function(){HarinNative.saveDataUrl(String(r.result)," + JSONObject.quote(name) + ");};r.readAsDataURL(x.response);};"
+                          + "x.onerror=function(){HarinNative.toast('Gagal membaca berkas');};x.send();})();";
+                      runOnUiThread(() -> src.evaluateJavascript(js, null));
+                      return;
+                  }
+                  if (url.startsWith("data:")) { writeDownload(url, name); return; }
+                  try {
+                      DownloadManager.Request r = new DownloadManager.Request(Uri.parse(url));
+                      String cookie = CookieManager.getInstance().getCookie(url);
+                      if (cookie != null) r.addRequestHeader("Cookie", cookie);
+                      if (ua != null) r.addRequestHeader("User-Agent", ua);
+                      r.setMimeType(mime);
+                      r.setTitle(name);
+                      r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                      if (Build.VERSION.SDK_INT >= 29) r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "Harinfood/" + name);
+                      else r.setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, name);
+                      ((DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE)).enqueue(r);
+                      runOnUiThread(() -> Toast.makeText(MainActivity.this, "Mengunduh " + name + " … (lihat notifikasi)", Toast.LENGTH_LONG).show());
+                  } catch (Exception e) {
+                      final String m = String.valueOf(e.getMessage());
+                      runOnUiThread(() -> Toast.makeText(MainActivity.this, "Gagal mengunduh: " + m, Toast.LENGTH_LONG).show());
+                  }
+              }
+
+              /** Simpan data base64 (hasil PDF dsb.) ke folder Download/Harinfood lalu buka. */
+              private void writeDownload(String dataUrl, String name) {
+                  try {
+                      int comma = dataUrl.indexOf(',');
+                      String meta = dataUrl.substring(5, comma);
+                      String mime = meta.contains(";") ? meta.substring(0, meta.indexOf(';')) : meta;
+                      if (mime.isEmpty()) mime = "application/octet-stream";
+                      byte[] bytes = Base64.decode(dataUrl.substring(comma + 1), Base64.DEFAULT);
+                      final String safe = name.replaceAll("[\\\\/:*?\"<>|]", "_");
+                      Uri uri = null;
+                      if (Build.VERSION.SDK_INT >= 29) {
+                          ContentValues v = new ContentValues();
+                          v.put(MediaStore.Downloads.DISPLAY_NAME, safe);
+                          v.put(MediaStore.Downloads.MIME_TYPE, mime);
+                          v.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Harinfood");
+                          v.put(MediaStore.Downloads.IS_PENDING, 1);
+                          uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                          if (uri == null) throw new Exception("Tidak bisa membuat berkas di Download");
+                          OutputStream os = getContentResolver().openOutputStream(uri);
+                          os.write(bytes);
+                          os.close();
+                          v.clear();
+                          v.put(MediaStore.Downloads.IS_PENDING, 0);
+                          getContentResolver().update(uri, v, null, null);
+                      } else {
+                          File dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+                          FileOutputStream fo = new FileOutputStream(new File(dir, safe));
+                          fo.write(bytes);
+                          fo.close();
+                      }
+                      final Uri fu = uri;
+                      final String fm = mime;
+                      runOnUiThread(() -> {
+                          Toast.makeText(MainActivity.this, "Tersimpan di Download/Harinfood: " + safe, Toast.LENGTH_LONG).show();
+                          if (fu != null) {
+                              try {
+                                  Intent i = new Intent(Intent.ACTION_VIEW);
+                                  i.setDataAndType(fu, fm);
+                                  i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+                                  startActivity(i);
+                              } catch (Exception ignored) { /* tidak ada aplikasi pembuka PDF: berkas tetap tersimpan */ }
+                          }
+                      });
+                  } catch (final Exception e) {
+                      runOnUiThread(() -> Toast.makeText(MainActivity.this, "Gagal menyimpan berkas: " + e.getMessage(), Toast.LENGTH_LONG).show());
+                  }
+              }
+
+              /** Jembatan JavaScript -> Android untuk halaman cetak/unduh (window.print & unduh blob). */
+              private class NativeBridge {
+                  private final WebView owner;
+                  NativeBridge(WebView owner) { this.owner = owner; }
+
+                  @JavascriptInterface
+                  public void printPage() { runOnUiThread(() -> doSystemPrint(owner, "Harinfood")); }
+
+                  @JavascriptInterface
+                  public void saveDataUrl(final String dataUrl, final String name) {
+                      new Thread(() -> writeDownload(dataUrl, name == null || name.isEmpty() ? "berkas" : name)).start();
+                  }
+
+                  @JavascriptInterface
+                  public void toast(final String msg) { runOnUiThread(() -> Toast.makeText(MainActivity.this, msg, Toast.LENGTH_SHORT).show()); }
+              }
+
               @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
               @Override
               protected void onCreate(Bundle savedInstanceState) {
@@ -370,7 +605,9 @@ jobs:
                   if (!need.isEmpty()) requestPermissions(need.toArray(new String[0]), BT_PERM_REQ);
 
                   webView = new WebView(this);
-                  setContentView(webView);
+                  root = new FrameLayout(this);
+                  root.addView(webView, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                  setContentView(root);
 
                   WebSettings st = webView.getSettings();
                   st.setJavaScriptEnabled(true);
@@ -381,11 +618,18 @@ jobs:
 
                   webView.addJavascriptInterface(new PrintBridge(), "HarinPrint");
                   webView.addJavascriptInterface(new GpsBridge(), "HarinGps");
+                  webView.addJavascriptInterface(new NativeBridge(webView), "HarinNative");
+                  webView.setDownloadListener(downloadListener(webView));
                   st.setGeolocationEnabled(true);
                   st.setSupportMultipleWindows(true);
                   st.setJavaScriptCanOpenWindowsAutomatically(true);
 
                   webView.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public void onPageFinished(WebView view, String url) {
+                          view.evaluateJavascript(HOOK_JS, null); // unduhan blob (mis. QRIS) & window.print di halaman utama
+                      }
+
                       @Override
                       public boolean shouldOverrideUrlLoading(WebView view, android.webkit.WebResourceRequest request) {
                           Uri u = request.getUrl();
@@ -406,42 +650,29 @@ jobs:
                   webView.setWebChromeClient(new WebChromeClient() {
                       @Override
                       public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, Message resultMsg) {
-                          if (printView != null) { try { printView.destroy(); } catch (Exception ignored) {} }
-                          final WebView popup = new WebView(MainActivity.this);
+                          if (popupContainer != null) closePopupOverlay();
+                          if (printView != null) { try { printView.destroy(); } catch (Exception ignored) {} printView = null; }
+                          final WebView popup = buildPopup();
                           printView = popup;
-                          popup.getSettings().setJavaScriptEnabled(true);
-                          popup.getSettings().setDomStorageEnabled(true);
-                          popup.setWebViewClient(new WebViewClient() {
-                              private boolean printed = false;
-
-                              @Override
-                              public boolean shouldOverrideUrlLoading(WebView v, android.webkit.WebResourceRequest request) {
-                                  String url = request.getUrl().toString();
-                                  if (isPrintUrl(url)) return false;
-                                  openExternal(url);
-                                  return true;
-                              }
-
-                              @Override
-                              public void onPageStarted(WebView v, String url, Bitmap favicon) {
-                                  if (url != null && !url.equals("about:blank") && !isPrintUrl(url)) {
-                                      v.stopLoading();
-                                      openExternal(url);
-                                  }
-                              }
-
-                              @Override
-                              public void onPageFinished(WebView v, String url) {
-                                  // about:blank = jendela kosong yang isinya ditulis lewat JavaScript (struk langsung)
-                                  if (printed || !(isPrintUrl(url) || "about:blank".equals(url))) return;
-                                  printed = true;
-                                  v.postDelayed(() -> doSystemPrint(v, "Harinfood"), 900);
-                              }
-                          });
                           WebView.WebViewTransport transport = (WebView.WebViewTransport) resultMsg.obj;
                           transport.setWebView(popup);
                           resultMsg.sendToTarget();
                           return true;
+                      }
+
+                      @Override
+                      public void onPermissionRequest(final PermissionRequest request) {
+                          runOnUiThread(() -> {
+                              boolean needCam = false;
+                              for (String r : request.getResources()) if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(r)) needCam = true;
+                              if (!needCam) { request.deny(); return; }
+                              if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                                  request.grant(new String[]{PermissionRequest.RESOURCE_VIDEO_CAPTURE});
+                              } else {
+                                  pendingPermRequest = request;
+                                  requestPermissions(new String[]{Manifest.permission.CAMERA}, CAMERA_PERM_REQ);
+                              }
+                          });
                       }
 
                       @Override
@@ -474,6 +705,15 @@ jobs:
               @Override
               public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
                   super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                  if (requestCode == CAMERA_PERM_REQ) {
+                      boolean ok = false;
+                      for (int r : grantResults) if (r == PackageManager.PERMISSION_GRANTED) ok = true;
+                      if (pendingPermRequest != null) {
+                          if (ok) pendingPermRequest.grant(new String[]{PermissionRequest.RESOURCE_VIDEO_CAPTURE}); else pendingPermRequest.deny();
+                          pendingPermRequest = null;
+                      }
+                      return;
+                  }
                   if (requestCode == BT_PERM_REQ) {
                       if (prefs().getBoolean("bgservice", false)) startBgService();
                       return;
@@ -513,6 +753,10 @@ jobs:
 
               @Override
               public boolean onKeyDown(int keyCode, KeyEvent event) {
+                  if (keyCode == KeyEvent.KEYCODE_BACK && popupContainer != null) {
+                      closePopupOverlay();
+                      return true;
+                  }
                   if (keyCode == KeyEvent.KEYCODE_BACK && webView.canGoBack()) {
                       webView.goBack();
                       return true;
@@ -1159,6 +1403,8 @@ jobs:
               <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
               <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
               <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-feature android:name="android.hardware.camera" android:required="false" />
               <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
               <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
